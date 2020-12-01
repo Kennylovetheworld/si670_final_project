@@ -12,7 +12,6 @@ import warnings
 if __name__ == '__main__':
     data = open('../flickr-cropping-dataset/cropping_testing_set.json', 'r').read()
     db = json.loads(data)
-
     image_root = "../flickr-cropping-dataset/data/"
     for i, item in enumerate(db):
         

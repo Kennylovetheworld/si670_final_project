@@ -3,21 +3,30 @@ from collections import OrderedDict
 import torch.nn as nn
 import torch.nn.init as init
 import torch
+import torchvision.models as models
 import torch.nn.functional as F
 from torch.autograd import Variable
 import pdb
 
-def IOU_Loss(x11, y11, w1, h1, x21, y21, w2, h2):
+def L2_Loss(x11, y11, x12, y12, x21, y21, w2, h2):
+    x22 = x21 + w2
+    y22 = y21 + h2
+    loss = (x11-x21)**2 + (y11-y21)**2 + (x12-x22)**2 + (y12-y22)**2
+    return loss[0]
+
+def IOU_Loss(x11, y11, x12, y12, x21, y21, w2, h2):
+    w1 = (x12 - x11).clamp(min = 0)
+    h1 = (y12 - y11).clamp(min = 0)
     areas1 = w1 * h1
     areas2 = w2 * h2
-    x12, x22 = x11 + w1, x21 + w2
-    y12, y22 = y12 + h1, y22 + h2
+    x22 = x21 + w2
+    y22 = y21 + h2
     lt_x, lt_y = torch.max(x11, x21), torch.max(y11, y21) 
-    rb_x, rb_y = torch.min(x12, x22), torch.max(y12, y22)
+    rb_x, rb_y = torch.min(x12, x22), torch.min(y12, y22)
     I_w = (rb_x - lt_x).clamp(min=0)
     I_h = (rb_y - lt_y).clamp(min=0)
     I = I_w * I_h
-    IOU =  I / (areas1 + area2 - I)
+    IOU =  I / (areas1 + areas2 - I)
     loss = 1 - IOU.mean()
     return loss
 
@@ -30,17 +39,22 @@ class SPPLayer(nn.Module):
         self.pool_type = pool_type
 
     def forward(self, x):
+        # bs: the number of samples
+        # c: the number of channels
+        # h: height
+        # w: width
         bs, c, h, w = x.size()
         pooling_layers = []
         for i in range(self.num_levels):
             kernel_size = (h // (2 ** i), w // (2 ** i))
             if self.pool_type == 'max_pool':
                 tensor = F.max_pool2d(x, kernel_size=kernel_size,
-                                      stride=kernel_size).view(bs, -1)
+                                      stride=kernel_size).reshape(bs, -1)
             else:
                 tensor = F.avg_pool2d(x, kernel_size=kernel_size,
-                                      stride=kernel_size).view(bs, -1)
+                                      stride=kernel_size).reshape(bs, -1)
             pooling_layers.append(tensor)
+        # pdb.set_trace()
         x = torch.cat(pooling_layers, dim=-1)
         return x
 
@@ -59,7 +73,7 @@ class DetectionNetSPP(nn.Module):
 
         if resnet == True:
             self.conv_model = models.resnet18(pretrained=True)
-            self.conv_model = nn.Sequential(*list(self.resnet.children())[:-2]) # Remove the last classifier and the avg pooling
+            self.conv_model = nn.Sequential(*list(self.conv_model.children())[:-2]) # Remove the last classifier and the avg pooling
         else: 
             self.conv_model = nn.Sequential(OrderedDict([
             ('conv1' + name, nn.Conv2d(self.in_channels, 128, 3)), 
@@ -75,27 +89,22 @@ class DetectionNetSPP(nn.Module):
             ('relu4' + name, nn.ReLU())
             ]))
 
-            self.spp_layer = SPPLayer(spp_level)
-
-            self.linear_model = nn.Sequential(OrderedDict([
-            ('fc1' + name, nn.Linear(self.num_grids*128, 1024)),
-            ('fc1_relu' + name, nn.ReLU()),
-            ('fc2' + name, nn.Linear(1024, 2)),
-            ]))
+        self.spp_layer = SPPLayer(spp_level)
 
     def forward(self, x):
         # pdb.set_trace()
         x = self.conv_model(x)
         x = self.spp_layer(x)
-        x = self.linear_model(x)
         return x
 
 class CropProposalModel(nn.Module):
     def __init__(self, spp_level = 3):
         super(CropProposalModel, self).__init__()
-        self.saliency_net = DetectionNetSPP(spp_level = spp_level, in_channels = 1, name = '_saliency')
-        self.ori_img_net = DetectionNetSPP(spp_level = spp_level * 2, in_channels = 3, name = '_ori', resnet = True)
-        self.in_features = (self.saliency_net.num_grids + self.ori_img_net.num_grids) * 128
+        self.saliency_net = DetectionNetSPP(spp_level = 3, in_channels = 1, name = '_saliency')
+        self.ori_img_net = DetectionNetSPP(spp_level = 2, in_channels = 3, name = '_ori', resnet = True)
+        # 128 is the number of out_channel of the last convolutional layer of our self defined conv_model
+        # 512 is the number of out_channel of the last convolutional layer of resnet18
+        self.in_features = self.saliency_net.num_grids * 128 + self.ori_img_net.num_grids * 512
         self.out_features = 4
         self.linear_model = nn.Sequential(OrderedDict([
           ('fc1_crop', nn.Linear(self.in_features, 1024)),
@@ -105,11 +114,13 @@ class CropProposalModel(nn.Module):
         ]))
     
     def forward(self, ori_img, saliency_map):
+        # pdb.set_trace()
         saliency_map = saliency_map.permute(0, 3, 1, 2)
-        ori_img_w = ori_img.shape[-2]
-        ori_img_w = ori_img.shape[-1]
+        ori_img = ori_img.permute(0, 3, 1, 2)
+        # ori_img_w = ori_img.shape[-2]
+        # ori_img_w = ori_img.shape[-1]
         x1 = self.ori_img_net(ori_img)
-        x2 = self.salency_net(saliency_map)
+        x2 = self.saliency_net(saliency_map)
         x = torch.cat([x1, x2], dim = -1)
         x = self.linear_model(x)
         x = torch.sigmoid(x)
